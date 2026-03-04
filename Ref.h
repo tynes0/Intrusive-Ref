@@ -21,6 +21,7 @@ public:
     /** @brief Default constructor initializing reference counters. */
     RefCountedObject() noexcept = default;
 
+protected:
     /**
      * @brief Copy constructor. 
      * It ignores the reference counts of the original object. The new object starts with fresh references.
@@ -57,10 +58,8 @@ public:
         return *this; 
     }
 
-protected:
     /** @brief Virtual destructor to ensure proper cleanup of derived types. */
     virtual ~RefCountedObject() = default;
-
 public:
     /**
     * @brief Retrieves the current strong reference count.
