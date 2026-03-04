@@ -21,10 +21,48 @@ class RefCountedObject
 public:
     /** @brief Default constructor initializing reference counters. */
     RefCountedObject() noexcept = default;
-    
+
+    /**
+     * @brief Copy constructor. 
+     * It ignores the reference counts of the original object. The new object starts with fresh references.
+     */
+    RefCountedObject(const RefCountedObject&) noexcept 
+        : m_Strong(0), m_Weak(1) 
+    {
+    }
+
+    /**
+     * @brief Move constructor. 
+     * It ignores the reference numbers of the original object.
+     */
+    RefCountedObject(RefCountedObject&&) noexcept 
+        : m_Strong(0), m_Weak(1) 
+    {
+    }
+
+    /**
+     * @brief Copy assignment. 
+     * It prevents reference numbers from being written over. It does nothing else.
+     */
+    RefCountedObject& operator=(const RefCountedObject&) noexcept 
+    { 
+        return *this; 
+    }
+
+    /**
+     * @brief Move assignment. 
+     * It prevents reference numbers from being written over. It does nothing else.
+     */
+    RefCountedObject& operator=(RefCountedObject&&) noexcept 
+    { 
+        return *this; 
+    }
+
+protected:
     /** @brief Virtual destructor to ensure proper cleanup of derived types. */
     virtual ~RefCountedObject() = default;
 
+public:
     /**
     * @brief Retrieves the current strong reference count.
     * @return The number of active strong references.
@@ -115,16 +153,56 @@ private:
         return false;
     }
 
+    void DestroyInternal() const noexcept
+    {
+        delete this;
+    }
+
     template <typename T>
     friend class Ref;
 
     template <typename T>
     friend class WeakRef;
 
+    template <typename T>
+    friend struct RefDeleter;
+
     /** @brief Number of active strong references. */
     mutable std::atomic<uint32_t> m_Strong{0};
     /** @brief Number of active weak references + 1 (representing the strong refs' hold on memory). */
     mutable std::atomic<uint32_t> m_Weak{1};
+};
+
+template<typename T>
+struct RefDeleter
+{
+    static void Execute(T* ptr)
+    {
+        auto base = reinterpret_cast<RefCountedObject*>(ptr);
+
+        if (base->DecStrong() == 0)
+        {
+            base->OnZeroStrong();
+
+            if (base->DecWeak() == 0)
+            {
+                base->DestroyInternal();
+            }
+        }
+    }
+
+    static void ExecuteWeak(T* ptr)
+    {
+        if (!ptr)
+            return;
+
+        auto base = reinterpret_cast<RefCountedObject*>(ptr);
+
+        if (base->DecWeak() == 0)
+        {
+            base->DestroyInternal();
+        }
+    }
 };
 
 namespace DetailRef
@@ -138,7 +216,6 @@ namespace DetailRef
      * without incrementing its strong reference count.
      */
     struct AdoptTag {};
-
 }
 
 // ============================================================
@@ -171,8 +248,7 @@ public:
     explicit Ref(T* ptr) noexcept
         : m_Ptr(ptr)
     {
-        static_assert(std::is_base_of_v<RefCountedObject, T>,
-                      "T must derive from RefCountedObject");
+        // static_assert(std::is_base_of_v<RefCountedObject, T>, "T must derive from RefCountedObject");
         IncRef();
     }
 private:
@@ -248,7 +324,7 @@ public:
 
         T* newPtr = other.m_Ptr;
         if (newPtr)
-            newPtr->IncStrong();
+            static_cast<RefCountedObject*>(newPtr)->IncStrong();
 
         Release();
         m_Ptr = newPtr;
@@ -287,7 +363,7 @@ public:
             return *this;
 
         if (newPtr)
-            newPtr->IncStrong();
+            static_cast<RefCountedObject*>(newPtr)->IncStrong();
 
         Release();
         m_Ptr = newPtr;
@@ -379,7 +455,7 @@ public:
      * @return A Ref of the new type.
      */
     template <typename U>
-    requires std::is_base_of_v<T, U>
+    // requires std::is_base_of_v<T, U>
     [[nodiscard]] Ref<U> AsFast() const noexcept
     {
         return Ref<U>(static_cast<U*>(m_Ptr));
@@ -470,7 +546,7 @@ private:
     void IncRef() const noexcept
     {
         if (m_Ptr)
-            m_Ptr->IncStrong();
+            static_cast<const RefCountedObject*>(m_Ptr)->IncStrong();
     }
 
     /** @brief Internal helper to safely decrement counts and potentially destroy the object. */
@@ -479,18 +555,7 @@ private:
         if (!m_Ptr)
             return;
 
-        if (m_Ptr->DecStrong() == 0)
-        {
-            m_Ptr->OnZeroStrong();
-
-            if (m_Ptr->DecWeak() == 0)
-            {
-                m_Ptr->~T();
-                ::operator delete(m_Ptr);
-            }
-        }
-
-        m_Ptr = nullptr;
+        RefDeleter<T>::Execute(m_Ptr);
     }
 
     template <typename U>
@@ -599,7 +664,7 @@ public:
      */
     [[nodiscard]] bool Expired() const noexcept
     {
-        return !m_Ptr || m_Ptr->StrongCount() == 0;
+        return !m_Ptr || static_cast<const RefCountedObject*>(m_Ptr)->StrongCount() == 0;
     }
 
     /**
@@ -620,7 +685,7 @@ public:
         if (!m_Ptr)
             return nullptr;
 
-        if (!m_Ptr->TryIncStrong())
+        if (!reinterpret_cast<RefCountedObject*>(m_Ptr)->TryIncStrong())
             return nullptr;
 
         return Ref<T>(m_Ptr, DetailRef::AdoptTag{});
@@ -631,19 +696,13 @@ private:
     void IncWeakRef() noexcept
     {
         if (m_Ptr)
-            m_Ptr->IncWeak();
+            reinterpret_cast<const RefCountedObject*>(m_Ptr)->IncWeak();
     }
     
     /** @brief Internal helper to decrement the weak count and trigger memory deallocation if it hits zero. */
     void Release() noexcept
     {
-        if (m_Ptr && m_Ptr->DecWeak() == 0)
-        {
-            m_Ptr->~T(); 
-            ::operator delete(m_Ptr);
-        }
-
-        m_Ptr = nullptr;
+        RefDeleter<T>::ExecuteWeak(m_Ptr);
     }
 
     /** @brief The underlying raw pointer. */
