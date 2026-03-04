@@ -24,6 +24,12 @@ To use the reference counting system, your classes must publicly inherit from `R
 * `TryIncStrong()`: Atomically attempts to increment the strong count only if it is greater than zero. This is crucial for safely converting a `WeakRef` to a `Ref`.
 * `virtual void OnZeroStrong()`: A virtual callback invoked exactly once when the strong reference count reaches zero, right before the object is considered logically dead.
 
+### Copy & Move Semantics
+To guarantee memory safety and prevent "ghost references" or premature deletions, `RefCountedObject` strictly manages how objects are copied and moved:
+* **Protected Lifecycle**: The constructors and assignment operators are marked as `protected`. This prevents accidental object slicing and ensures `RefCountedObject` cannot be instantiated directly.
+* **Fresh Starts**: Copy and Move constructors completely ignore the reference counts of the source object. A newly constructed object always begins its life with fresh counters (`m_Strong = 0`, `m_Weak = 1`).
+* **Assignment Protection**: Copy and Move assignment operators (`operator=`) are explicitly defined to do absolutely nothing to the reference counters. They protect the current object's identity and prevent its reference counts from being overwritten by the source object.
+
 ---
 
 ## 2. `Ref<T>`
@@ -38,22 +44,7 @@ To use the reference counting system, your classes must publicly inherit from `R
     * `AsFast<U>()`: Performs a `static_cast` (requires type safety assurance from the caller).
 * **Memory Management**: When the last `Ref<T>` is destroyed, it triggers `OnZeroStrong()` and decrements the weak count. If the weak count also hits zero, the memory is deallocated.
 
-### Example:
-```cpp
-class MyEntity : public RefCountedObject {
-public:
-    MyEntity() { /* ... */ }
-    ~MyEntity() override { /* ... */ }
-};
-
-// Creating a strong reference
-Ref<MyEntity> entity = Ref<MyEntity>::Create();
-
-// Passing by value increments strong count
-void ProcessEntity(Ref<MyEntity> e) {
-    // e.StrongCount() is at least 2 here
-}
-```
+---
 
 ## 3. `WeakRef<T>`
 
@@ -66,22 +57,98 @@ void ProcessEntity(Ref<MyEntity> e) {
     * If the object has already been logically destroyed, `Lock()` safely returns a null `Ref<T>`.
 * **Concurrency Safe**: Because it utilizes the `TryIncStrong()` atomic operation via a Compare-And-Swap (CAS) loop, locking is inherently thread-safe. It prevents race conditions where an object might begin its destruction sequence exactly as another thread attempts to access it.
 
-### Example:
+---
+
+## Usage Examples
+
+### Example 1: Basic Polymorphism and Casting
+In an intrusive system, interfaces that will be managed by `Ref<T>` must themselves inherit from `RefCountedObject`. This ensures safe casting and reference counting across the inheritance hierarchy.
+
 ```cpp
-Ref<MyEntity> strongEntity = Ref<MyEntity>::Create();
-WeakRef<MyEntity> weakEntity = strongEntity;
+// The interface itself derives from the intrusive base
+class ISystem : public RefCountedObject {
+public:
+    virtual ~ISystem() = default;
+    virtual void Update() = 0;
+};
 
-// The strong reference is dropped, triggering logical destruction
-strongEntity.Reset(); 
+// The derived class naturally inherits the reference counting capabilities
+class PhysicsSystem : public ISystem {
+public:
+    void Update() override { /* ... */ }
+    void ApplyForce() { /* ... */ }
+};
 
-// Attempting to access the entity later
-if (Ref<MyEntity> locked = weakEntity.Lock()) {
-    // Object is still alive, safe to use 'locked'
-} else {
-    // The object's strong count reached zero, safely handle the null case
-    // (This path will be executed in this specific example)
+// Create a strong reference of the derived type
+Ref<PhysicsSystem> physics = Ref<PhysicsSystem>::Create();
+
+// Implicit upcast to the Base interface works perfectly
+Ref<ISystem> system = physics; 
+
+// Safe Downcasting back to the Derived type using the built-in As() method
+if (Ref<PhysicsSystem> downcasted = system.As<PhysicsSystem>()) {
+    downcasted->ApplyForce();
 }
 ```
+
+### Example 2: Breaking Cyclic Dependencies
+
+If a Parent node holds a strong `Ref` to its Child, and the Child holds a strong `Ref` to its Parent, their strong counts will never reach zero. `WeakRef` solves this.
+
+```cpp
+class Node : public RefCountedObject {
+public:
+    WeakRef<Node> parent; // SAFE: Weak reference prevents circular dependency leak
+    std::vector<Ref<Node>> children;
+
+    void AddChild(Ref<Node> child) {
+        // Assigning strong Ref to WeakRef is done implicitly
+        child->parent = Ref<Node>(this); 
+        children.push_back(child);
+    }
+
+    void PrintParent() {
+        // Must lock to use the weak pointer safely
+        if (Ref<Node> p = parent.Lock()) {
+            // Parent is alive and locked securely, safe to use 'p'
+        } else {
+            // Parent has been destroyed
+        }
+    }
+};
+```
+
+### Example 3: Forward Declarations (The Complete Type Requirement)
+When hiding implementation details in `.cpp` files, you must ensure the class is fully defined when the `Ref` goes out of scope.
+
+```cpp
+// --- MySystem.h ---
+#pragma once
+#include "Ref.h"
+
+class HeavyData; // Forward declaration
+
+class MySystem {
+public:
+    MySystem();
+    ~MySystem(); // Destructor MUST NOT be inline here!
+
+private:
+    Ref<HeavyData> m_Data;
+};
+
+// --- MySystem.cpp ---
+#include "MySystem.h"
+#include "HeavyData.h" // Full definition required here for safe destruction!
+
+MySystem::MySystem() : m_Data(Ref<HeavyData>::Create()) {}
+
+// The compiler knows the size and layout of HeavyData here, 
+// so the intrusive deleter can safely cast and clean up.
+MySystem::~MySystem() = default; 
+```
+
+---
 
 ## Lifecycle & Memory Management
 
@@ -116,3 +183,20 @@ The library provides high-performance thread safety by utilizing `std::atomic` f
   Decrementing counters uses `std::memory_order_acq_rel` (and `std::memory_order_acquire` for strong count reads). This acts as a critical memory barrier. It guarantees that any modifications made to the object's data by thread A are fully visible to thread B before thread B executes `OnZeroStrong()` or `~T()`.
 * **Safe Weak-to-Strong Upgrades**:
   The `TryIncStrong` method (used internally by `WeakRef::Lock`) employs a Compare-And-Swap (CAS) loop with `compare_exchange_weak`. It strictly ensures that a weak reference cannot accidentally resurrect an object that is simultaneously in the process of dropping its strong count to zero on another thread.
+
+---
+
+## Best Practices & Limitations
+
+While this library offers high performance, the nature of intrusive reference counting imposes a few strict C++ rules that must be followed.
+
+### 1. Heap Allocation Only
+Objects managed by `Ref<T>` and deriving from `RefCountedObject` **must never be created on the stack**. The internal memory management relies on `delete this;` when the physical destruction phase concludes. If an object is allocated on the stack and managed by a `Ref<T>`, the program will crash when the smart pointer attempts to free stack memory.
+* **Best Practice**: Always use `Ref<T>::Create(...)` or `MakeRef<T>(...)` to instantiate your objects. You may also make your derived class constructors `private` or `protected` to enforce this rule at compile-time.
+
+### 2. Safe Multiple Inheritance
+The library internally uses `static_cast` instead of raw `reinterpret_cast` when converting pointers during the destruction phase. This means **Multiple Inheritance is fully and safely supported**. The compiler will correctly calculate memory offsets if your class inherits from multiple interfaces alongside `RefCountedObject`.
+
+### 3. The "Complete Type" Requirement (Forward Declarations)
+Standard `std::shared_ptr` can often destroy objects that are only forward-declared (incomplete types) because it uses a separate, type-erased control block. This library, being intrusive, requires the compiler to know the exact layout of your class to safely execute the `static_cast` and call the internal destructors.
+* **The Rule**: You can use forward declarations (e.g., `class MyEntity;`) in your `.h` files to declare `Ref<MyEntity>` members. However, in the `.cpp` file where the `Ref<MyEntity>` is actually destroyed, reassigned, or reset, **you must `#include` the full header** of `MyEntity`. Failing to do so will result in a compile-time error protecting you from undefined behavior.
