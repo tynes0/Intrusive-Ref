@@ -384,6 +384,18 @@ public:
     {
         return Ref<U>(static_cast<U*>(m_Ptr));
     }
+    
+    /**
+     * @brief Checks if the managed object is of a specific type.
+     * Uses dynamic_cast to determine if the underlying object can be safely cast to type U.
+     * @tparam U The type to check against.
+     * @return True if the object is of type U (or derived from U), false otherwise.
+     */
+    template <typename U>
+    [[nodiscard]] bool Is() const noexcept
+    {
+        return static_cast<bool>(dynamic_cast<U*>(m_Ptr));
+    }
 
     /**
      * @brief Factory method for creating managed objects and returning them inside a Ref.
@@ -395,6 +407,19 @@ public:
     [[nodiscard]] static Ref Create(Args&&... args)
     {
         return Ref(new T(std::forward<Args>(args)...));
+    }
+
+    /**
+     * @brief Relinquishes ownership of the managed object without decrementing the strong count.
+     * @warning The caller is now strictly responsible for calling DecStrong() manually 
+     * or wrapping the pointer back into a Ref using the AdoptTag.
+     * @return The raw pointer.
+     */
+    [[nodiscard]] T* Detach() noexcept
+    {
+        T* ptr = m_Ptr;
+        m_Ptr = nullptr;
+        return ptr;
     }
 
     // comparisons
@@ -411,6 +436,18 @@ public:
         return m_Ptr != other.m_Ptr;
     }
 
+    /** @brief Equality check with ptr. */
+    [[nodiscard]] bool operator==(T* other) const noexcept
+    {
+        return m_Ptr == other;
+    }
+
+    /** @brief Inequality check with ptr. */
+    [[nodiscard]] bool operator!=(T* other) const noexcept
+    {
+        return m_Ptr != other;
+    }
+
     /** @brief Equality check with nullptr. */
     [[nodiscard]] bool operator==(std::nullptr_t) const noexcept
     {
@@ -421,6 +458,11 @@ public:
     [[nodiscard]] bool operator!=(std::nullptr_t) const noexcept
     {
         return m_Ptr != nullptr;
+    }
+
+    [[nodiscard]] bool operator<(const Ref& other) const noexcept
+    {
+        return m_Ptr < other.m_Ptr;
     }
 
 private:
@@ -550,6 +592,26 @@ public:
     }
 
     /**
+     * @brief Checks if the managed object has been logically destroyed.
+     * @warning This is a snapshot. In multithreaded environments, the object could 
+     * expire immediately after this returns true. Always use Lock() for safe access.
+     * @return True if the object is dead or null, false otherwise.
+     */
+    [[nodiscard]] bool Expired() const noexcept
+    {
+        return !m_Ptr || m_Ptr->StrongCount() == 0;
+    }
+
+    /**
+     * @brief Releases the weak reference and resets the pointer to null.
+     */
+    void Reset() noexcept
+    {
+        Release();
+        m_Ptr = nullptr;
+    }
+
+    /**
      * @brief Attempts to lock the weak reference, upgrading it to a strong reference.
      * @return A valid Ref<T> if the object is still alive, otherwise a null Ref.
      */
@@ -586,4 +648,31 @@ private:
 
     /** @brief The underlying raw pointer. */
     T* m_Ptr = nullptr;
+};
+
+/**
+ * @brief Global helper function to create a new RefCountedObject and return a Ref<T>.
+ * Similar to std::make_shared.
+ * @tparam T The type of the object to create.
+ * @tparam Args Argument types to forward to the constructor.
+ * @param args Arguments to pass to the object's constructor.
+ * @return A valid Ref<T> managing the newly allocated object.
+ */
+template <typename T, typename... Args>
+[[nodiscard]] Ref<T> MakeRef(Args&&... args)
+{
+    return Ref<T>::Create(std::forward<Args>(args)...);
+}
+
+/**
+ * @brief std::hash specialization for Ref<T> to allow usage in unordered containers.
+ */
+template <typename T>
+// NOLINTNEXTLINE(cert-dcl58-cpp)
+struct std::hash<Ref<T>>
+{
+    [[nodiscard]] std::size_t operator()(const Ref<T>& ref) const noexcept
+    {
+        return std::hash<T*>{}(ref.Get());
+    }
 };
