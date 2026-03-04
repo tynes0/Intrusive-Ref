@@ -15,7 +15,6 @@
  * inherit from this class. It provides thread-safe atomic counters for both 
  * strong and weak references.
  */
-// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
 class RefCountedObject
 {
 public:
