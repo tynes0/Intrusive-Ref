@@ -176,7 +176,9 @@ struct RefDeleter
 {
     static void Execute(T* ptr)
     {
-        auto base = reinterpret_cast<RefCountedObject*>(ptr);
+        static_assert(sizeof(T) != 0, "T is an incomplete type! Include the header where this Ref is destroyed.");
+
+        RefCountedObject* base = ptr;
 
         if (base->DecStrong() == 0)
         {
@@ -194,7 +196,8 @@ struct RefDeleter
         if (!ptr)
             return;
 
-        auto base = reinterpret_cast<RefCountedObject*>(ptr);
+        static_assert(sizeof(T) != 0, "T is an incomplete type! Include the header where this WeakRef is destroyed.");
+        RefCountedObject* base = ptr;
 
         if (base->DecWeak() == 0)
         {
@@ -554,6 +557,7 @@ private:
             return;
 
         RefDeleter<T>::Execute(m_Ptr);
+        m_Ptr = nullptr;
     }
 
     template <typename U>
@@ -683,7 +687,7 @@ public:
         if (!m_Ptr)
             return nullptr;
 
-        if (!reinterpret_cast<RefCountedObject*>(m_Ptr)->TryIncStrong())
+        if (!static_cast<RefCountedObject*>(m_Ptr)->TryIncStrong())
             return nullptr;
 
         return Ref<T>(m_Ptr, DetailRef::AdoptTag{});
@@ -694,13 +698,14 @@ private:
     void IncWeakRef() noexcept
     {
         if (m_Ptr)
-            reinterpret_cast<const RefCountedObject*>(m_Ptr)->IncWeak();
+            static_cast<const RefCountedObject*>(m_Ptr)->IncWeak();
     }
     
     /** @brief Internal helper to decrement the weak count and trigger memory deallocation if it hits zero. */
     void Release() noexcept
     {
         RefDeleter<T>::ExecuteWeak(m_Ptr);
+        m_Ptr = nullptr;
     }
 
     /** @brief The underlying raw pointer. */
